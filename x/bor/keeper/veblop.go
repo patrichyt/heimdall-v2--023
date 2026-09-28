@@ -1,0 +1,638 @@
+package keeper
+
+import (
+	"context"
+	"fmt"
+	"sort"
+
+	"cosmossdk.io/collections"
+	sdk "github.com/cosmos/cosmos-sdk/types"
+
+	"github.com/0xPolygon/heimdall-v2/helper"
+	heimdallTypes "github.com/0xPolygon/heimdall-v2/types"
+	"github.com/0xPolygon/heimdall-v2/x/bor/types"
+	staketypes "github.com/0xPolygon/heimdall-v2/x/stake/types"
+)
+
+// AddNewVeBlopSpan adds a new veBlop (Validator-elected block producer) span.
+//
+// fallbackToActiveSet opts the caller into the post-Ithaca empty-candidate recovery in
+// SelectNextSpanProducer. Only the future-span PreBlocker path passes true: there an empty
+// candidate set is a fatal chain halt. The rotation / pending-stall / side-message callers pass
+// false and keep their existing skip-and-retry behavior on an empty selection.
+func (k *Keeper) AddNewVeBlopSpan(ctx sdk.Context, currentProducer uint64, startBlock uint64, endBlock uint64, borChainID string, activeValidatorIDs map[uint64]struct{}, heimdallBlock uint64, targetProducerID uint64, excludedProducerIDs map[uint64]struct{}, fallbackToActiveSet bool) error {
+	logger := k.Logger(ctx)
+
+	// select next producers
+	newProducerId, err := k.SelectNextSpanProducer(ctx, currentProducer, activeValidatorIDs, helper.GetProducerSetLimit(ctx), startBlock, endBlock, targetProducerID, excludedProducerIDs, fallbackToActiveSet)
+	if err != nil {
+		return err
+	}
+
+	valSet, err := k.sk.GetValidatorSet(ctx)
+	if err != nil {
+		return err
+	}
+
+	newProducer, err := k.sk.GetValidatorFromValID(ctx, newProducerId)
+	if err != nil {
+		return err
+	}
+
+	// Post-Ithaca, the producer serialized into the span must have positive voting power. Check the
+	// resolved record itself, not the validator-set snapshot by id: an approved exit earlier in the
+	// same block zeroes the individual validator record while the current-set snapshot is not
+	// refreshed until the stake module's PreBlock, so a by-id snapshot check can read stale positive
+	// power for an already-exited validator. Bor reads a zero-power producer as a validator deletion
+	// and panics snapshot construction, so fail closed rather than commit it.
+	if helper.IsIthaca(ctx.BlockHeight()) && newProducer.VotingPower <= 0 {
+		return fmt.Errorf("selected producer %d has non-positive voting power", newProducerId)
+	}
+
+	lastSpan, err := k.GetLastSpan(ctx)
+	if err != nil {
+		return err
+	}
+
+	// generate new span
+	newSpan := &types.Span{
+		Id:                lastSpan.Id + 1,
+		StartBlock:        startBlock,
+		EndBlock:          endBlock,
+		ValidatorSet:      valSet,
+		SelectedProducers: []staketypes.Validator{newProducer},
+		BorChainId:        borChainID,
+	}
+
+	logger.Info("Freezing new veBlop span", "span", newSpan.LogSpan())
+
+	err = k.AddNewSpan(ctx, newSpan)
+	if err != nil {
+		return err
+	}
+
+	return k.SetLastSpanBlock(ctx, heimdallBlock)
+}
+
+// filterToCurrentValidators drops any id that is not a positive-power member of the current
+// validator set, preserving order. An exited validator's record survives with zero power and is
+// absent from the current set; keeping it out prevents freezing it as a span producer.
+func (k *Keeper) filterToCurrentValidators(ctx sdk.Context, ids []uint64) ([]uint64, error) {
+	if len(ids) == 0 {
+		return ids, nil
+	}
+	valSet, err := k.sk.GetValidatorSet(ctx)
+	if err != nil {
+		return nil, err
+	}
+	eligible := make(map[uint64]struct{}, len(valSet.Validators))
+	for _, v := range valSet.Validators {
+		if v.VotingPower > 0 {
+			eligible[v.ValId] = struct{}{}
+		}
+	}
+	filtered := make([]uint64, 0, len(ids))
+	for _, id := range ids {
+		if _, ok := eligible[id]; ok {
+			filtered = append(filtered, id)
+		}
+	}
+	return filtered, nil
+}
+
+func (k *Keeper) FindCurrentProducerID(ctx context.Context, blockNum uint64) (uint64, error) {
+	lastSpan, err := k.GetLastSpan(ctx)
+	if err != nil {
+		return 0, err
+	}
+
+	for i := lastSpan.Id; ; i-- {
+		span, err := k.GetSpan(ctx, i)
+		if err != nil {
+			return 0, err
+		}
+
+		if blockNum >= span.StartBlock && blockNum <= span.EndBlock {
+			return span.SelectedProducers[0].ValId, nil
+		}
+
+		if i == 0 {
+			break
+		}
+	}
+
+	return 0, fmt.Errorf("no active producer found")
+}
+
+func (k *Keeper) FindPastBackupProducerIDs(ctx context.Context, blockNum uint64) ([]uint64, error) {
+	lastSpan, err := k.GetLastSpan(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	producerIDs := make([]uint64, 0)
+	for i := lastSpan.Id; i > 0; i-- {
+		span, err := k.GetSpan(ctx, i)
+		if err != nil {
+			return nil, err
+		}
+
+		if blockNum > span.EndBlock {
+			break
+		}
+
+		if blockNum == span.StartBlock {
+			producerIDs = append(producerIDs, span.SelectedProducers[0].ValId)
+		}
+	}
+
+	return producerIDs, nil
+}
+
+func (k *Keeper) UpdateValidatorPerformanceScore(ctx context.Context, activeValidatorIDs map[uint64]struct{}, blocks uint64) error {
+	for validatorID := range activeValidatorIDs {
+		hasKey, err := k.PerformanceScore.Has(ctx, validatorID)
+		if err != nil {
+			return err
+		}
+
+		if !hasKey {
+			err := k.PerformanceScore.Set(ctx, validatorID, blocks)
+			if err != nil {
+				return err
+			}
+		} else {
+			currentScore, err := k.PerformanceScore.Get(ctx, validatorID)
+			if err != nil {
+				return err
+			}
+			err = k.PerformanceScore.Set(ctx, validatorID, currentScore+blocks)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+func (k *Keeper) ResetValidatorPerformanceScore(ctx context.Context) error {
+	return k.PerformanceScore.Clear(ctx, nil)
+}
+
+func (k *Keeper) GetAllValidatorPerformanceScore(ctx context.Context) (map[uint64]uint64, error) {
+	iter, err := k.PerformanceScore.Iterate(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	validatorPerformanceScore := make(map[uint64]uint64)
+	for ; iter.Valid(); iter.Next() {
+		validatorID, err := iter.Key()
+		if err != nil {
+			return nil, err
+		}
+
+		score, err := iter.Value()
+		if err != nil {
+			return nil, err
+		}
+
+		validatorPerformanceScore[validatorID] = score
+	}
+
+	return validatorPerformanceScore, nil
+}
+
+// UpdateLatestActiveProducer updates the latest active producer
+func (k *Keeper) UpdateLatestActiveProducer(ctx context.Context, activeProducerIDs map[uint64]struct{}) error {
+	err := k.LatestActiveProducer.Clear(ctx, nil)
+	if err != nil {
+		return err
+	}
+
+	for producerID := range activeProducerIDs {
+		err := k.LatestActiveProducer.Set(ctx, producerID)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// GetLatestActiveProducer returns the latest active producer
+func (k *Keeper) GetLatestActiveProducer(ctx context.Context) (map[uint64]struct{}, error) {
+	iter, err := k.LatestActiveProducer.Iterate(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	latestActiveProducer := make(map[uint64]struct{})
+	for ; iter.Valid(); iter.Next() {
+		producerID, err := iter.Key()
+		if err != nil {
+			return nil, err
+		}
+		latestActiveProducer[producerID] = struct{}{}
+	}
+
+	return latestActiveProducer, nil
+}
+
+func (k *Keeper) AddLatestFailedProducer(ctx context.Context, producerID uint64) error {
+	err := k.LatestFailedProducer.Set(ctx, producerID)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (k *Keeper) GetLatestFailedProducer(ctx context.Context) (map[uint64]struct{}, error) {
+	iter, err := k.LatestFailedProducer.Iterate(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	latestFailedProducer := make(map[uint64]struct{})
+	for ; iter.Valid(); iter.Next() {
+		producerID, err := iter.Key()
+		if err != nil {
+			return nil, err
+		}
+		latestFailedProducer[producerID] = struct{}{}
+	}
+
+	return latestFailedProducer, nil
+}
+
+func (k *Keeper) ClearLatestFailedProducer(ctx context.Context) error {
+	err := k.LatestFailedProducer.Clear(ctx, nil)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// SelectNextSpanProducer selects the next producer for a new span.
+// It calculates the candidate set, filters by active producers, and selects one.
+func (k *Keeper) SelectNextSpanProducer(ctx sdk.Context, currentProducer uint64, activeValidatorIDs map[uint64]struct{}, producerSetLimit, startBlock, endBlock uint64, targetProducerID uint64, excludedProducerIDs map[uint64]struct{}, fallbackToActiveSet bool) (uint64, error) {
+	candidates, err := k.CalculateProducerSet(ctx, producerSetLimit)
+	if err != nil {
+		return 0, fmt.Errorf("failed to calculate producer set: %w", err)
+	}
+
+	if len(candidates) == 0 {
+		candidates = helper.GetFallbackProducerVotes()
+		if producerSetLimit > 0 && uint64(len(candidates)) > producerSetLimit {
+			candidates = candidates[:producerSetLimit]
+		}
+	}
+
+	activeCandidates := k.FilterByActiveProducerSet(ctx, candidates, activeValidatorIDs)
+
+	// Honor an explicit exclusion set before the empty check, so an exclusion that fully empties the
+	// active set still triggers the fallback below instead of handing an empty slice to SelectProducer.
+	activeCandidates = filterExcludedProducers(activeCandidates, excludedProducerIDs)
+
+	// Post-Ithaca, drop any candidate that is not a positive-power member of the current validator
+	// set. Candidates come from producer votes and the milestone supporter set, both of which can
+	// still name a validator that has since exited (its record survives with zero power, absent from
+	// the current set). Freezing such a producer yields a span Bor cannot build a snapshot from.
+	// Filtering before the empty check routes a fully-exited set into the fallback below.
+	ithaca := helper.IsIthaca(ctx.BlockHeight())
+	if ithaca {
+		if activeCandidates, err = k.filterToCurrentValidators(ctx, activeCandidates); err != nil {
+			return 0, err
+		}
+	}
+
+	// If no candidate is available after threshold filtering,
+	// rotate the original candidate list to the next producer EVEN IF the producer is not active.
+	if len(activeCandidates) == 0 {
+		newCandidates := make([]uint64, 0, len(candidates))
+		for _, validatorID := range candidates {
+			if validatorID != currentProducer {
+				newCandidates = append(newCandidates, validatorID)
+			}
+		}
+		activeCandidates = filterExcludedProducers(newCandidates, excludedProducerIDs)
+		if ithaca {
+			if activeCandidates, err = k.filterToCurrentValidators(ctx, activeCandidates); err != nil {
+				return 0, err
+			}
+		}
+	}
+
+	// Post-Ithaca, recover a candidate so the future-span path (the only opt-in via fallbackToActiveSet) can't hand SelectProducer an empty set (see eligibleProducerFallback).
+	if len(activeCandidates) == 0 && fallbackToActiveSet && ithaca {
+		activeCandidates = k.eligibleProducerFallback(ctx, currentProducer, activeValidatorIDs, excludedProducerIDs)
+	}
+	// If the declaring producer requested a specific replacement, try to honor it.
+	// The target must still be an active candidate and not down for the range.
+	// If any check fails, we fall through to round-robin rather than blocking span creation.
+	if targetProducerID != types.RoundRobinDefault && ctx.BlockHeight() >= helper.GetZurichHardforkHeight() {
+		// Defense-in-depth: reject self-targeting even if upstream callers should have caught it.
+		if targetProducerID == currentProducer {
+			k.Logger(ctx).Warn("Target producer is the same as current producer, falling through to round-robin",
+				"targetProducerID", targetProducerID, "currentProducer", currentProducer)
+		} else {
+			// Target producer must be in the active candidate set.
+			targetInCandidates := false
+			for _, c := range activeCandidates {
+				if c == targetProducerID {
+					targetInCandidates = true
+					break
+				}
+			}
+			if targetInCandidates {
+				isDown, err := k.IsProducerDownForBlockRange(ctx, startBlock, endBlock, targetProducerID)
+				if err != nil {
+					k.Logger(ctx).Error("Failed to check target producer downtime, falling through to round-robin",
+						"targetProducerID", targetProducerID, "error", err)
+				} else if !isDown {
+					k.Logger(ctx).Info("Using target producer override",
+						"currentProducer", currentProducer, "targetProducer", targetProducerID)
+					return targetProducerID, nil
+				} else {
+					k.Logger(ctx).Warn("Target producer is down for range, falling through to round-robin",
+						"targetProducerID", targetProducerID)
+				}
+			} else {
+				k.Logger(ctx).Warn("Target producer not in active candidates, falling through to round-robin",
+					"targetProducerID", targetProducerID)
+			}
+		}
+	}
+
+	nextProducer, err := k.SelectProducer(ctx, currentProducer, activeCandidates, startBlock, endBlock)
+	if err != nil {
+		return 0, fmt.Errorf("failed to select producer: %w", err)
+	}
+
+	return nextProducer, nil
+}
+
+// resolveVoterStake returns the voting power to credit a voter's ballot and
+// whether the ballot should be counted at all. Post-Zurich, only validators in
+// the active set (activeStake) count, with their active-set power; pre-Zurich,
+// any validator with positive power in its individual record counts.
+func (k *Keeper) resolveVoterStake(ctx context.Context, validatorID uint64, zurich bool, activeStake map[uint64]int64) (int64, bool) {
+	if zurich {
+		stake, ok := activeStake[validatorID]
+		if !ok || stake <= 0 {
+			k.Logger(ctx).Debug("Skipping producer votes from non-active validator", "validatorID", validatorID)
+			return 0, false
+		}
+		return stake, true
+	}
+
+	validator, err := k.sk.GetValidatorFromValID(ctx, validatorID)
+	if err != nil {
+		k.Logger(ctx).Debug("Failed to get validator for producer vote, skipping", "validatorID", validatorID, "error", err)
+		return 0, false
+	}
+	if validator.VotingPower <= 0 {
+		k.Logger(ctx).Debug("Validator has no voting power, skipping votes", "validatorID", validatorID)
+		return 0, false
+	}
+
+	return validator.VotingPower, true
+}
+
+// CalculateProducerSet ranks producer candidates by the sum of the stake from validators who voted for them,
+// weighted by their relative position in the candidate list.
+func (k *Keeper) CalculateProducerSet(ctx context.Context, producerSetLimit uint64) ([]uint64, error) {
+	allValidators, err := k.sk.GetValidatorSet(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", heimdallTypes.ErrMsgFailedToGetValidatorSet, err)
+	}
+
+	totalPotentialProducers := uint64(len(allValidators.Validators))
+	if totalPotentialProducers == 0 {
+		k.Logger(ctx).Info("No validators found, cannot calculate producer set.")
+		return []uint64{}, nil
+	}
+
+	producerWeightedScores := make(map[uint64]int64) // Will now be the sum of stakes
+
+	// Post-Zurich, only validators in the active set contribute to scoring, with
+	// the same per-validator power that feeds the threshold denominator below.
+	// This keeps deactivated validators' stale power out of the numerator and
+	// keeps numerator and denominator on a single, consistent basis.
+	zurich := helper.IsZurichHardfork(sdk.UnwrapSDKContext(ctx).BlockHeight())
+	var activeStake map[uint64]int64
+	if zurich {
+		activeStake = make(map[uint64]int64, len(allValidators.Validators))
+		for _, val := range allValidators.Validators {
+			activeStake[val.ValId] = val.VotingPower
+		}
+	}
+
+	votesIterator, err := k.ProducerVotes.Iterate(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to iterate producer votes: %w", err)
+	}
+	defer func(votesIterator collections.Iterator[uint64, types.ProducerVotes]) {
+		err := votesIterator.Close()
+		if err != nil {
+			k.Logger(ctx).Error("Failed to close producer votes iterator", "error", err)
+		}
+	}(votesIterator)
+
+	for ; votesIterator.Valid(); votesIterator.Next() {
+		validatorID, err := votesIterator.Key()
+		if err != nil {
+			return nil, fmt.Errorf("failed to get key from producer votes iterator: %w", err)
+		}
+
+		producerVoteData, err := votesIterator.Value()
+		if err != nil {
+			k.Logger(ctx).Error("Failed to get value from producer votes iterator, skipping", "validatorID", validatorID, "error", err)
+			continue
+		}
+
+		validatorStake, ok := k.resolveVoterStake(ctx, validatorID, zurich, activeStake)
+		if !ok {
+			continue
+		}
+
+		// Consider only the first 'totalPotentialProducers' candidates from the vote list.
+		// Apply positional weighting: higher positions get higher weights.
+		for i, candidateID := range producerVoteData.Votes {
+			if uint64(i) >= totalPotentialProducers {
+				break // Only consider top N votes where N is totalPotentialProducers
+			}
+			// Weight decreases by position: (totalPotentialProducers - position) * validatorStake
+			positionWeight := int64(totalPotentialProducers - uint64(i))
+			producerWeightedScores[candidateID] += positionWeight * validatorStake
+		}
+	}
+
+	if len(producerWeightedScores) == 0 {
+		k.Logger(ctx).Warn("No producer votes recorded or no valid votes found.")
+		return []uint64{}, nil
+	}
+
+	type scoredProducer struct {
+		ID    uint64
+		Score int64
+	}
+
+	rankedProducers := make([]scoredProducer, 0, len(producerWeightedScores))
+	for id, score := range producerWeightedScores {
+		rankedProducers = append(rankedProducers, scoredProducer{ID: id, Score: score})
+	}
+
+	// Sort producers by score in descending order.
+	// If scores are equal, sort by ID ascending for determinism.
+	sort.SliceStable(rankedProducers, func(i, j int) bool {
+		if rankedProducers[i].Score == rankedProducers[j].Score {
+			return rankedProducers[i].ID < rankedProducers[j].ID
+		}
+		return rankedProducers[i].Score > rankedProducers[j].Score
+	})
+
+	// Calculate the total stake of all validators for threshold calculation
+	var totalStakeOfAllValidators int64
+	for _, val := range allValidators.Validators {
+		totalStakeOfAllValidators += val.VotingPower
+	}
+
+	if totalStakeOfAllValidators == 0 {
+		k.Logger(ctx).Warn("Total stake of all validators is 0. No producers can qualify under threshold logic.")
+		return []uint64{}, nil
+	}
+
+	finalCandidates := make([]uint64, 0, producerSetLimit)
+	for i, sp := range rankedProducers {
+		if i >= int(producerSetLimit) {
+			break // Reached producer set limit
+		}
+
+		// Calculate the positional threshold: candidate needs >= 2/3 of the max possible weighted vote at their position
+		position := uint64(i) + 1 // 1-indexed position
+		maxPossibleWeightedVoteAtPosition := int64(totalPotentialProducers-position+1) * totalStakeOfAllValidators
+		positionalRequiredScore := (maxPossibleWeightedVoteAtPosition * 2 / 3) + 1
+
+		k.Logger(ctx).Debug("Threshold check for candidate",
+			"candidateID", sp.ID,
+			"candidateScore", sp.Score,
+			"position", position,
+			"maxPossibleWeightedVoteAtPosition", maxPossibleWeightedVoteAtPosition,
+			"positionalRequiredScore", positionalRequiredScore)
+
+		if sp.Score >= positionalRequiredScore {
+			finalCandidates = append(finalCandidates, sp.ID)
+		} else {
+			k.Logger(ctx).Debug("Candidate failed to meet positional threshold, stopping further selection.",
+				"candidateID", sp.ID,
+				"candidateScore", sp.Score,
+				"positionalRequiredScore", positionalRequiredScore)
+			break // Stop adding candidates if one fails to qualify
+		}
+	}
+
+	k.Logger(ctx).Debug("Calculated producer set", "count", len(finalCandidates), "candidates", finalCandidates)
+	return finalCandidates, nil
+}
+
+// filterExcludedProducers drops any candidate present in excluded, preserving order. A nil/empty
+// exclusion set returns the candidates unchanged (no-op for non-stall callers).
+func filterExcludedProducers(candidates []uint64, excluded map[uint64]struct{}) []uint64 {
+	if len(excluded) == 0 {
+		return candidates
+	}
+	filtered := make([]uint64, 0, len(candidates))
+	for _, candidate := range candidates {
+		if _, isExcluded := excluded[candidate]; !isExcluded {
+			filtered = append(filtered, candidate)
+		}
+	}
+	return filtered
+}
+
+// FilterByActiveProducerSet filters candidates based on whether each candidate has voted for the last X milestones.
+func (k *Keeper) FilterByActiveProducerSet(_ context.Context, candidates []uint64, activeValidatorIDs map[uint64]struct{}) []uint64 {
+	activeCandidates := make([]uint64, 0, len(candidates))
+
+	for _, candidate := range candidates {
+		if _, ok := activeValidatorIDs[candidate]; ok {
+			activeCandidates = append(activeCandidates, candidate)
+		}
+	}
+	return activeCandidates
+}
+
+// SelectProducer selects a producer from the candidates list, starting after the current producer,
+// wrapping around. It skips any candidate that is down for the given [startBlock, endBlock].
+// If all candidates are down (full cycle), it returns candidates[0].
+func (k *Keeper) SelectProducer(ctx sdk.Context, currentProducer uint64, candidates []uint64, startBlock, endBlock uint64) (uint64, error) {
+	if len(candidates) == 0 {
+		k.Logger(ctx).Error("SelectProducer called with no candidates")
+		return 0, fmt.Errorf("no candidates found")
+	}
+
+	// Find index of current producer (if present)
+	currentIndex := -1
+	for i, candidate := range candidates {
+		if candidate == currentProducer {
+			currentIndex = i
+			break
+		}
+	}
+
+	// Starting index: next after current, or 0 if current not present
+	startIdx := 0
+	if currentIndex != -1 {
+		startIdx = (currentIndex + 1) % len(candidates)
+	} else {
+		k.Logger(ctx).Debug("Current producer not in candidate list, starting from first candidate", "currentProducer", currentProducer, "selected", candidates[0])
+	}
+
+	// Walk at most len(candidates) steps, skipping any candidate that is down
+	n := len(candidates)
+	for i := 0; i < n; i++ {
+		idx := (startIdx + i) % n
+		c := candidates[idx]
+
+		isDown, err := k.IsProducerDownForBlockRange(ctx, startBlock, endBlock, c)
+		if err != nil {
+			return 0, fmt.Errorf("failed checking producer %d downtime: %w", c, err)
+		}
+		if !isDown {
+			k.Logger(ctx).Debug("Selecting next producer (not down for range)", "currentProducer", currentProducer, "selected", c, "startBlock", startBlock, "endBlock", endBlock)
+			return c, nil
+		}
+
+		k.Logger(ctx).Debug("Skipping candidate producer (down for range)", "candidate", c, "startBlock", startBlock, "endBlock", endBlock)
+	}
+
+	// Full cycle and everyone is down: return the first candidate as a fallback
+	k.Logger(ctx).Error("All candidates are down for the requested range; falling back to first candidate", "fallback", candidates[0], "startBlock", startBlock, "endBlock", endBlock)
+	return candidates[0], nil
+}
+
+// IsProducerDownForBlockRange checks if a producer has planned downtime overlapping with the given block range.
+func (k *Keeper) IsProducerDownForBlockRange(ctx sdk.Context, startBlock, endBlock, producerID uint64) (bool, error) {
+	found, err := k.ProducerPlannedDowntime.Has(ctx, producerID)
+	if err != nil {
+		return false, err
+	}
+	if !found {
+		return false, nil
+	}
+
+	downtime, err := k.ProducerPlannedDowntime.Get(ctx, producerID)
+	if err != nil {
+		return false, err
+	}
+
+	if startBlock <= downtime.EndBlock && endBlock >= downtime.StartBlock {
+		return true, nil
+	}
+
+	return false, nil
+}

@@ -1,0 +1,412 @@
+package grpc
+
+import (
+	"context"
+	"fmt"
+	"math/big"
+
+	proto "github.com/0xPolygon/polyproto/bor"
+	commonproto "github.com/0xPolygon/polyproto/common"
+	protoutil "github.com/0xPolygon/polyproto/utils"
+	"github.com/ethereum/go-ethereum"
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/common/hexutil"
+	ethTypes "github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/rpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+)
+
+func (c *BorGRPCClient) GetRootHash(ctx context.Context, startBlock uint64, endBlock uint64) (string, error) {
+	req := &proto.GetRootHashRequest{
+		StartBlockNumber: startBlock,
+		EndBlockNumber:   endBlock,
+	}
+
+	res, err := c.client.GetRootHash(ctx, req)
+	if err != nil {
+		return "", err
+	}
+	if res == nil {
+		return "", ethereum.NotFound
+	}
+
+	return res.RootHash, nil
+}
+
+func (c *BorGRPCClient) GetVoteOnHash(ctx context.Context, startBlock uint64, endBlock uint64, rootHash string, milestoneId string) (bool, error) {
+	req := &proto.GetVoteOnHashRequest{
+		StartBlockNumber: startBlock,
+		EndBlockNumber:   endBlock,
+		Hash:             rootHash,
+		MilestoneId:      milestoneId,
+	}
+
+	res, err := c.client.GetVoteOnHash(ctx, req)
+	if err != nil {
+		return false, err
+	}
+	if res == nil {
+		return false, ethereum.NotFound
+	}
+
+	return res.Response, nil
+}
+
+func (c *BorGRPCClient) HeaderByNumber(ctx context.Context, blockID int64) (*ethTypes.Header, error) {
+	blockNumberAsString := ToBlockNumArg(big.NewInt(blockID))
+
+	req := &proto.GetHeaderByNumberRequest{
+		Number: blockNumberAsString,
+	}
+
+	res, err := c.client.HeaderByNumber(ctx, req)
+	if err != nil {
+		// Translate gRPC NotFound to ethereum.NotFound so callers see the
+		// same sentinel regardless of HTTP vs gRPC transport.
+		if status.Code(err) == codes.NotFound {
+			return nil, ethereum.NotFound
+		}
+		return nil, err
+	}
+	if res == nil || res.Header == nil {
+		return nil, ethereum.NotFound
+	}
+	// protoHeaderToEthHeader returns nil for a malformed header
+	// (e.g., oversized bloom / difficulty / baseFee).
+	// Surface that as NotFound so callers never nil-deref downstream.
+	h := protoHeaderToEthHeader(res.Header)
+	if h == nil {
+		return nil, ethereum.NotFound
+	}
+	if blockID >= 0 && h.Number.Int64() != blockID {
+		return nil, fmt.Errorf("bor grpc HeaderByNumber: server returned block %d for request %d", h.Number.Int64(), blockID)
+	}
+	return h, nil
+}
+
+func (c *BorGRPCClient) BlockByNumber(ctx context.Context, blockID int64) (*ethTypes.Block, error) {
+	blockNumberAsString := ToBlockNumArg(big.NewInt(blockID))
+
+	req := &proto.GetBlockByNumberRequest{
+		Number: blockNumberAsString,
+	}
+
+	res, err := c.client.BlockByNumber(ctx, req)
+	if err != nil {
+		// Translate gRPC NotFound to ethereum.NotFound so callers see the
+		// same sentinel regardless of HTTP vs gRPC transport.
+		if status.Code(err) == codes.NotFound {
+			return nil, ethereum.NotFound
+		}
+		return nil, err
+	}
+	if res == nil || res.Block == nil || res.Block.Header == nil {
+		return nil, ethereum.NotFound
+	}
+	// Same malformed-header guard as HeaderByNumber
+	header := protoHeaderToEthHeader(res.Block.Header)
+	if header == nil {
+		return nil, ethereum.NotFound
+	}
+	// Same guard as HeaderByNumber.
+	if blockID >= 0 && header.Number.Int64() != blockID {
+		return nil, fmt.Errorf("bor grpc BlockByNumber: server returned block %d for request %d", header.Number.Int64(), blockID)
+	}
+	return ethTypes.NewBlockWithHeader(header), nil
+}
+
+func (c *BorGRPCClient) TransactionReceipt(ctx context.Context, txHash common.Hash) (*ethTypes.Receipt, error) {
+	req := &proto.ReceiptRequest{
+		Hash: protoutil.ConvertHashToH256(txHash),
+	}
+
+	res, err := c.client.TransactionReceipt(ctx, req)
+	if err != nil {
+		// Translate gRPC NotFound to ethereum.NotFound so callers see the
+		// same sentinel regardless of HTTP vs gRPC transport.
+		if status.Code(err) == codes.NotFound {
+			return nil, ethereum.NotFound
+		}
+		return nil, err
+	}
+	if res == nil || res.Receipt == nil {
+		return nil, ethereum.NotFound
+	}
+	r := receiptResponseToTypesReceipt(res.Receipt)
+	if r == nil {
+		return nil, ethereum.NotFound
+	}
+	return r, nil
+}
+
+func (c *BorGRPCClient) BorBlockReceipt(ctx context.Context, txHash common.Hash) (*ethTypes.Receipt, error) {
+	req := &proto.ReceiptRequest{
+		Hash: protoutil.ConvertHashToH256(txHash),
+	}
+
+	res, err := c.client.BorBlockReceipt(ctx, req)
+	if err != nil {
+		// Translate gRPC NotFound to ethereum.NotFound so callers see the
+		// same sentinel regardless of HTTP vs gRPC transport.
+		if status.Code(err) == codes.NotFound {
+			return nil, ethereum.NotFound
+		}
+		return nil, err
+	}
+	if res == nil || res.Receipt == nil {
+		return nil, ethereum.NotFound
+	}
+	r := receiptResponseToTypesReceipt(res.Receipt)
+	if r == nil {
+		return nil, ethereum.NotFound
+	}
+	return r, nil
+}
+
+// GetAuthor returns the author of the block at blockNum. Nil blockNum resolves
+// to the latest block (via ToBlockNumArg, which maps nil to "latest").
+func (c *BorGRPCClient) GetAuthor(ctx context.Context, blockNum *big.Int) (*common.Address, error) {
+	req := &proto.GetAuthorRequest{Number: ToBlockNumArg(blockNum)}
+
+	res, err := c.client.GetAuthor(ctx, req)
+	if err != nil {
+		// Translate gRPC NotFound to ethereum.NotFound so callers see the
+		// same sentinel regardless of HTTP vs gRPC transport.
+		if status.Code(err) == codes.NotFound {
+			return nil, ethereum.NotFound
+		}
+		return nil, err
+	}
+	// Missing-author and missing-response are both surfaced as ethereum.NotFound,
+	// matching the RPC methods (HeaderByNumber, BlockByNumber, GetTdByHash, GetTdByNumber) and
+	// the HTTP path's ethclient contract.
+	if res == nil || res.Author == nil {
+		return nil, ethereum.NotFound
+	}
+
+	addr := protoH160ToAddress(res.Author)
+	return &addr, nil
+}
+
+// GetTdByHash returns the total difficulty of the block identified by hash.
+func (c *BorGRPCClient) GetTdByHash(ctx context.Context, hash common.Hash) (uint64, error) {
+	req := &proto.GetTdByHashRequest{Hash: protoutil.ConvertHashToH256(hash)}
+	res, err := c.client.GetTdByHash(ctx, req)
+	if err != nil {
+		// Translate gRPC NotFound to ethereum.NotFound so callers see the
+		// same sentinel regardless of HTTP vs gRPC transport.
+		if status.Code(err) == codes.NotFound {
+			return 0, ethereum.NotFound
+		}
+		return 0, err
+	}
+	if res == nil {
+		return 0, ethereum.NotFound
+	}
+	return res.TotalDifficulty, nil
+}
+
+// GetTdByNumber returns the total difficulty of the block at blockNum.
+// Nil blockNum resolves to the latest block.
+func (c *BorGRPCClient) GetTdByNumber(ctx context.Context, blockNum *big.Int) (uint64, error) {
+	req := &proto.GetTdByNumberRequest{Number: ToBlockNumArg(blockNum)}
+	res, err := c.client.GetTdByNumber(ctx, req)
+	if err != nil {
+		// Translate gRPC NotFound to ethereum.NotFound so callers see the
+		// same sentinel regardless of HTTP vs gRPC transport.
+		if status.Code(err) == codes.NotFound {
+			return 0, ethereum.NotFound
+		}
+		return 0, err
+	}
+	if res == nil {
+		return 0, ethereum.NotFound
+	}
+	return res.TotalDifficulty, nil
+}
+
+// GetBlockInfoInBatch returns headers, total difficulties, and authors for the
+// inclusive block range [start, end]. Returns up to (end-start+1) entries; a
+// shorter slice means the server encountered a missing block or other error
+// mid-range, matching the HTTP eth_getHeaderByNumber batch semantics.
+// Returns an error for invalid input ranges.
+func (c *BorGRPCClient) GetBlockInfoInBatch(ctx context.Context, start, end int64) ([]*ethTypes.Header, []uint64, []common.Address, error) {
+	if start < 0 || end < 0 || end < start {
+		return nil, nil, nil, fmt.Errorf("invalid range [%d,%d]", start, end)
+	}
+	if end-start > MaxBlockInfoBatchSize-1 {
+		return nil, nil, nil, fmt.Errorf("range too large: %d blocks exceeds max %d", end-start+1, MaxBlockInfoBatchSize)
+	}
+
+	req := &proto.GetBlockInfoInBatchRequest{
+		StartBlockNumber: uint64(start),
+		EndBlockNumber:   uint64(end),
+	}
+	res, err := c.client.GetBlockInfoInBatch(ctx, req)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if res == nil {
+		return nil, nil, nil, ethereum.NotFound
+	}
+
+	// maxLen is bounded by MaxBlockInfoBatchSize.
+	// Mirrors the HTTP-side collateBorBatchResults shape.
+	maxLen := int(end - start + 1)
+	headers := make([]*ethTypes.Header, 0, maxLen)
+	tds := make([]uint64, 0, maxLen)
+	authors := make([]common.Address, 0, maxLen)
+
+	for _, b := range res.Blocks {
+		if len(headers) >= maxLen {
+			break
+		}
+		if b == nil || b.Header == nil {
+			break
+		}
+		// Stop on a malformed header, matching the HTTP side
+		h := protoHeaderToEthHeader(b.Header)
+		if h == nil {
+			break
+		}
+		// The block number must match the next expected slot in
+		// the requested range. Otherwise, wrong hashes land in
+		// downstream milestone propositions.
+		expected := uint64(start) + uint64(len(headers))
+		if h.Number.Uint64() != expected {
+			break
+		}
+		// Match HTTP collateBorBatchResults: a non-genesis block with no
+		// author entry is a failure. Break instead of appending a
+		// zero-address placeholder that diverges from the HTTP path.
+		if b.Author == nil && b.Header.Number != 0 {
+			break
+		}
+		headers = append(headers, h)
+		tds = append(tds, b.TotalDifficulty)
+
+		// Nil-safe wrapper: handles the (nil author | nil inner Hi) case
+		// for genesis blocks, where the server is allowed to send nil author.
+		addr := protoH160ToAddress(b.Author)
+		authors = append(authors, addr)
+	}
+
+	return headers, tds, authors, nil
+}
+
+func receiptResponseToTypesReceipt(receipt *proto.Receipt) *ethTypes.Receipt {
+	// Reject out-of-range values for fields that would truncate or overflow in ethTypes.Receipt, mapping them to NotFound.
+	if receipt.Type > 0xff {
+		return nil
+	}
+	// Bloom and Logs have been intentionally left out as they are not used in the current implementation
+	return &ethTypes.Receipt{
+		Type:              uint8(receipt.Type),
+		PostState:         receipt.PostState,
+		Status:            receipt.Status,
+		CumulativeGasUsed: receipt.CumulativeGasUsed,
+		TxHash:            protoH256ToHash(receipt.TxHash),
+		ContractAddress:   protoH160ToAddress(receipt.ContractAddress),
+		GasUsed:           receipt.GasUsed,
+		EffectiveGasPrice: big.NewInt(receipt.EffectiveGasPrice),
+		BlobGasUsed:       receipt.BlobGasUsed,
+		BlobGasPrice:      big.NewInt(receipt.BlobGasPrice),
+		BlockHash:         protoH256ToHash(receipt.BlockHash),
+		BlockNumber:       big.NewInt(receipt.BlockNumber),
+		TransactionIndex:  uint(receipt.TransactionIndex),
+	}
+}
+
+func ToBlockNumArg(number *big.Int) string {
+	if number == nil {
+		return "latest"
+	}
+	if number.Sign() >= 0 {
+		return hexutil.EncodeBig(number)
+	}
+	// It's negative.
+	if number.IsInt64() {
+		return rpc.BlockNumber(number.Int64()).String()
+	}
+	// It's negative and large, which is invalid.
+	return fmt.Sprintf("<invalid %d>", number)
+}
+
+// protoHeaderToEthHeader rebuilds a full ethTypes.Header from the proto wire
+// form. Returns nil on a nil or malformed input (e.g., out-of-bounds bloom) so
+// callers can map it to ethereum.NotFound.
+func protoHeaderToEthHeader(p *proto.Header) *ethTypes.Header {
+	if p == nil {
+		return nil
+	}
+
+	if len(p.Bloom) != 0 && len(p.Bloom) != ethTypes.BloomByteLength {
+		return nil
+	}
+
+	if len(p.Difficulty) > 32 || len(p.BaseFee) > 32 {
+		return nil
+	}
+	// ethTypes.Header.Nonce is a fixed BlockNonceLength (8) byte array.
+	if len(p.Nonce) != 0 && len(p.Nonce) != len(ethTypes.BlockNonce{}) {
+		return nil
+	}
+
+	h := &ethTypes.Header{
+		ParentHash:  protoH256ToHash(p.ParentHash),
+		UncleHash:   protoH256ToHash(p.UncleHash),
+		Coinbase:    protoH160ToAddress(p.Coinbase),
+		Root:        protoH256ToHash(p.StateRoot),
+		TxHash:      protoH256ToHash(p.TxRoot),
+		ReceiptHash: protoH256ToHash(p.ReceiptRoot),
+		Difficulty:  new(big.Int).SetBytes(p.Difficulty),
+		Number:      new(big.Int).SetUint64(p.Number),
+		GasLimit:    p.GasLimit,
+		GasUsed:     p.GasUsed,
+		Time:        p.Time,
+		Extra:       append([]byte(nil), p.ExtraData...),
+		MixDigest:   protoH256ToHash(p.MixDigest),
+	}
+	h.Bloom.SetBytes(p.Bloom)
+	copy(h.Nonce[:], p.Nonce)
+
+	if len(p.BaseFee) > 0 {
+		h.BaseFee = new(big.Int).SetBytes(p.BaseFee)
+	}
+	if p.WithdrawalsHash != nil {
+		v := protoH256ToHash(p.WithdrawalsHash)
+		h.WithdrawalsHash = &v
+	}
+	// BlobGasUsed and ExcessBlobGas are proto3 `optional`.
+	// We use *uint64 as a direct pointer, so the copy preserves nil vs. zero.
+	h.BlobGasUsed = p.BlobGasUsed
+	h.ExcessBlobGas = p.ExcessBlobGas
+	if p.ParentBeaconBlockRoot != nil {
+		v := protoH256ToHash(p.ParentBeaconBlockRoot)
+		h.ParentBeaconRoot = &v
+	}
+	if p.RequestsHash != nil {
+		v := protoH256ToHash(p.RequestsHash)
+		h.RequestsHash = &v
+	}
+	return h
+}
+
+// protoH256ToHash converts a proto H256 (or nil) to a common.Hash.
+func protoH256ToHash(h *commonproto.H256) common.Hash {
+	if h == nil || h.Hi == nil || h.Lo == nil {
+		return common.Hash{}
+	}
+	b := protoutil.ConvertH256ToHash(h)
+	return common.BytesToHash(b[:])
+}
+
+// protoH160ToAddress converts a proto H160 (or nil) to a common.Address.
+func protoH160ToAddress(a *commonproto.H160) common.Address {
+	if a == nil || a.Hi == nil {
+		return common.Address{}
+	}
+	arr := protoutil.ConvertH160toAddress(a)
+	return common.BytesToAddress(arr[:])
+}
